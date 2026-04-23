@@ -9,7 +9,7 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-MAX_TOOL_OUTPUT_CHARS = 6000
+MAX_TOOL_OUTPUT_CHARS = 12000
 TOOL_NAME = "run_command"
 TOOL_DESCRIPTION = (
     "Run a local shell or CLI command and return the exit code, stdout, stderr, "

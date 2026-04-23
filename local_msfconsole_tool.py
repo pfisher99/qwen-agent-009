@@ -14,10 +14,13 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 TOOL_NAME = "msfconsole"
-MAX_TOOL_OUTPUT_CHARS = 12000
-MAX_BUFFER_CHARS = 200000
+MAX_TOOL_OUTPUT_CHARS = 24000
+MAX_BUFFER_CHARS = 400000
 MSFCONSOLE_COMMAND = ["msfconsole", "-q"]
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ANSI_OSC_PATTERN = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+ANSI_ESC_PATTERN = re.compile(r"\x1b[@-Z\\-_]")
+CONTROL_CHARS_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 TOOL_DESCRIPTION = (
     "Control one persistent msfconsole session for authorized security testing. "
@@ -82,7 +85,10 @@ def output_to_text(value: Any) -> str:
 
 def clean_output(value: Any) -> str:
     text = output_to_text(value)
+    text = ANSI_OSC_PATTERN.sub("", text)
     text = ANSI_PATTERN.sub("", text)
+    text = ANSI_ESC_PATTERN.sub("", text)
+    text = CONTROL_CHARS_PATTERN.sub("", text)
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -217,7 +223,7 @@ class MsfConsoleSession:
         import pty
 
         master_fd, slave_fd = pty.openpty()
-        env = {**os.environ, "TERM": os.environ.get("TERM", "xterm")}
+        env = {**os.environ, "TERM": "dumb", "NO_COLOR": "1"}
         try:
             self.process = subprocess.Popen(
                 command,

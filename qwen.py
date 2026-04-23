@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -26,10 +28,15 @@ base_url = "http://192.168.11.90:8000"
 model_name = "Qwen3.5-9B-local"
 api_key = "EMPTY"
 ENABLE_THINKING = True
-REQUEST_TIMEOUT_SECONDS = 120
-MAX_TOOL_ROUNDS_PER_TURN = 100
+REQUEST_TIMEOUT_SECONDS = 300
+MAX_TOOL_ROUNDS_PER_TURN = 200
 system_prompt = Path.read_text(PROJECT_ROOT / "system_prompt.txt", encoding="utf-8")
 OPENAI_TOOLS = [*RUN_COMMAND_OPENAI_TOOLS, MSFCONSOLE_OPENAI_TOOL]
+ANSI_CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ANSI_OSC_PATTERN = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+ANSI_ESC_PATTERN = re.compile(r"\x1b[@-Z\\-_]")
+CONTROL_CHARS_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+TERMINAL_RESET_SEQUENCE = "\x1b[0m\x1b[?25h\x1b[?2004l"
 
 generate_cfg = {
     "temperature": 0.6,
@@ -59,6 +66,111 @@ class StepLogger:
         )
         path.write_text(text, encoding="utf-8")
         return path
+
+
+class TerminalGuard:
+    def __init__(self) -> None:
+        self.fd: int | None = None
+        self.attrs: list[Any] | None = None
+        if not sys.stdin.isatty():
+            return
+
+        try:
+            import termios
+
+            self.fd = sys.stdin.fileno()
+            self.attrs = termios.tcgetattr(self.fd)
+        except (ImportError, OSError, ValueError):
+            self.fd = None
+            self.attrs = None
+
+    def restore_mode(self) -> None:
+        if self.fd is None or self.attrs is None:
+            return
+
+        try:
+            import termios
+
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.attrs)
+        except (ImportError, OSError, ValueError):
+            pass
+
+    def reset_display(self) -> None:
+        for stream in (sys.stdout, sys.stderr):
+            if not stream.isatty():
+                continue
+            try:
+                stream.write(TERMINAL_RESET_SEQUENCE)
+                stream.flush()
+            except OSError:
+                pass
+
+    def restore(self) -> None:
+        self.restore_mode()
+        self.reset_display()
+
+
+TERMINAL_GUARD = TerminalGuard()
+atexit.register(TERMINAL_GUARD.restore)
+
+
+def strip_terminal_sequences(text: str) -> str:
+    text = ANSI_OSC_PATTERN.sub("", text)
+    text = ANSI_CSI_PATTERN.sub("", text)
+    text = ANSI_ESC_PATTERN.sub("", text)
+    text = CONTROL_CHARS_PATTERN.sub("", text)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def terminal_sequence_is_complete(text: str) -> bool:
+    if text.startswith("\x1b["):
+        return bool(ANSI_CSI_PATTERN.match(text))
+    if text.startswith("\x1b]"):
+        return "\x07" in text or "\x1b\\" in text
+    return len(text) >= 2 and "@" <= text[1] <= "_"
+
+
+def split_incomplete_terminal_sequence(text: str) -> tuple[str, str]:
+    escape_index = text.rfind("\x1b")
+    if escape_index == -1:
+        return text, ""
+
+    tail = text[escape_index:]
+    if terminal_sequence_is_complete(tail):
+        return text, ""
+    return text[:escape_index], tail
+
+
+class TerminalOutputSanitizer:
+    def __init__(self) -> None:
+        self.pending = ""
+
+    def clean(self, value: Any) -> str:
+        text = self.pending + stringify_any(value)
+        text, self.pending = split_incomplete_terminal_sequence(text)
+        return strip_terminal_sequences(text)
+
+    def clear(self) -> None:
+        self.pending = ""
+
+
+STDOUT_TERMINAL_SANITIZER = TerminalOutputSanitizer()
+STDERR_TERMINAL_SANITIZER = TerminalOutputSanitizer()
+
+
+def sanitize_terminal_text(value: Any) -> str:
+    return strip_terminal_sequences(stringify_any(value))
+
+
+def print_stream_text(value: Any, *, file: Any = None) -> None:
+    target = file or sys.stdout
+    sanitizer = STDERR_TERMINAL_SANITIZER if target is sys.stderr else STDOUT_TERMINAL_SANITIZER
+    print(sanitizer.clean(value), end="", file=target, flush=True)
+
+
+def clear_terminal_output_sanitizers() -> None:
+    STDOUT_TERMINAL_SANITIZER.clear()
+    STDERR_TERMINAL_SANITIZER.clear()
 
 
 def make_json_safe(value: Any) -> Any:
@@ -326,12 +438,12 @@ def stream_chat_completion(
                     if not think_started:
                         print("\n<think>", file=sys.stderr)
                         think_started = True
-                    print(reasoning_delta, end="", file=sys.stderr, flush=True)
+                    print_stream_text(reasoning_delta, file=sys.stderr)
 
             content_delta = delta.get("content") or ""
             if content_delta:
                 assistant_message["content"] += content_delta
-                print(content_delta, end="", flush=True)
+                print_stream_text(content_delta)
                 printed_output = True
 
             delta_tool_calls = delta.get("tool_calls") or []
@@ -345,6 +457,8 @@ def stream_chat_completion(
         print("\n</think>", file=sys.stderr)
     if printed_output:
         print()
+    clear_terminal_output_sanitizers()
+    TERMINAL_GUARD.restore()
 
     if not assistant_message["tool_calls"]:
         assistant_message.pop("tool_calls")
@@ -362,7 +476,7 @@ def execute_tool_calls(assistant_message: dict[str, Any]) -> list[dict[str, Any]
         tool_name = function.get("name", "")
         arguments = function.get("arguments", "")
 
-        print(f"[tool] {tool_name}", flush=True)
+        print(f"[tool] {sanitize_terminal_text(tool_name)}", flush=True)
 
         if tool_name == RUN_COMMAND_TOOL_NAME:
             tool_output = execute_run_command(arguments)
@@ -466,6 +580,7 @@ def repl(debug_raw: bool = False, debug_think: bool = False) -> None:
     print("Type 'exit' or 'quit' to stop.")
 
     while True:
+        TERMINAL_GUARD.restore()
         query = input("user question: ").strip()
         if not query:
             continue
