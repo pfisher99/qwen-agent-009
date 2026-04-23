@@ -58,7 +58,7 @@ def build_shell_command(command: str) -> tuple[list[str], str]:
 class RunCommandTool(BaseTool):
     description = (
         "Run a local shell or CLI command and return the exit code, stdout, stderr, "
-        "and working directory. On Windows this tool uses PowerShell."
+        "and working directory."
     )
     parameters = {
         "type": "object",
