@@ -48,10 +48,19 @@ OPENAI_TOOLS = [
 ]
 
 
-def clip_text(value: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
-    if len(value) <= limit:
-        return value
-    return f"{value[:limit]}\n...[truncated to {limit} characters]"
+def output_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
+def clip_text(value: Any, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    text = output_to_text(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n...[truncated to {limit} characters]"
 
 
 def load_tool_params(params: Any) -> dict[str, Any]:

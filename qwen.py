@@ -17,6 +17,8 @@ base_url = "http://192.168.11.90:8000"
 model_name = "Qwen3.5-9B-local"
 api_key = "EMPTY"
 ENABLE_THINKING = True
+REQUEST_TIMEOUT_SECONDS = 120
+MAX_TOOL_ROUNDS_PER_TURN = 8
 system_prompt = Path.read_text(PROJECT_ROOT / "system_prompt.txt", encoding="utf-8")
 
 generate_cfg = {
@@ -262,7 +264,7 @@ def stream_chat_completion(
     printed_output = False
 
     try:
-        response = urllib.request.urlopen(request)
+        response = urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS)
     except urllib.error.HTTPError as exc:
         error_text = exc.read().decode("utf-8", errors="replace")
         raise SystemExit(f"Request failed: HTTP {exc.code}\n{error_text}") from exc
@@ -305,6 +307,9 @@ def stream_chat_completion(
             delta_tool_calls = delta.get("tool_calls") or []
             if delta_tool_calls:
                 append_tool_call_delta(assistant_message["tool_calls"], delta_tool_calls)
+
+            if finish_reason:
+                break
 
     if debug_think and think_started:
         print("\n</think>", file=sys.stderr)
@@ -356,19 +361,43 @@ def chat_until_complete(
     debug_think: bool,
     step_logger: StepLogger,
 ) -> list[dict[str, Any]]:
+    tool_rounds = 0
+    force_no_tools = False
+
     while True:
         assistant_message, finish_reason = stream_chat_completion(
             messages,
-            with_tools=with_tools,
+            with_tools=with_tools and not force_no_tools,
             debug_raw=debug_raw,
             debug_think=debug_think,
         )
         messages.append(assistant_message)
 
         tool_messages: list[dict[str, Any]] = []
-        if with_tools and finish_reason == "tool_calls" and assistant_message.get("tool_calls"):
+        if (
+            with_tools
+            and not force_no_tools
+            and finish_reason == "tool_calls"
+            and assistant_message.get("tool_calls")
+        ):
+            tool_rounds += 1
             tool_messages = execute_tool_calls(assistant_message)
             messages.extend(tool_messages)
+            if tool_rounds >= MAX_TOOL_ROUNDS_PER_TURN:
+                print(
+                    "[tool] tool round limit reached; asking for a summary without more tools.",
+                    flush=True,
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Tool round limit reached for this turn. Summarize the "
+                            "results so far and ask what to do next. Do not call tools."
+                        ),
+                    }
+                )
+                force_no_tools = True
 
         step_logger.write_model_call(assistant_message, tool_messages)
 
