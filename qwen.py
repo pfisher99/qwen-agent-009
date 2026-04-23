@@ -9,7 +9,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from local_run_command_tool import OPENAI_TOOLS, TOOL_NAME, execute_run_command
+from local_msfconsole_tool import (
+    OPENAI_TOOL as MSFCONSOLE_OPENAI_TOOL,
+    TOOL_NAME as MSFCONSOLE_TOOL_NAME,
+    execute_msfconsole,
+)
+from local_run_command_tool import (
+    OPENAI_TOOLS as RUN_COMMAND_OPENAI_TOOLS,
+    TOOL_NAME as RUN_COMMAND_TOOL_NAME,
+    execute_run_command,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -18,8 +27,9 @@ model_name = "Qwen3.5-9B-local"
 api_key = "EMPTY"
 ENABLE_THINKING = True
 REQUEST_TIMEOUT_SECONDS = 120
-MAX_TOOL_ROUNDS_PER_TURN = 8
+MAX_TOOL_ROUNDS_PER_TURN = 100
 system_prompt = Path.read_text(PROJECT_ROOT / "system_prompt.txt", encoding="utf-8")
+OPENAI_TOOLS = [*RUN_COMMAND_OPENAI_TOOLS, MSFCONSOLE_OPENAI_TOOL]
 
 generate_cfg = {
     "temperature": 0.6,
@@ -138,7 +148,7 @@ def format_step_log(
     tool_calls = assistant_message.get("tool_calls") or []
     for index, tool_call in enumerate(tool_calls, start=1):
         function = tool_call.get("function") or {}
-        name = str(function.get("name") or "").strip() or TOOL_NAME
+        name = str(function.get("name") or "").strip() or "tool"
         arguments = format_text_block(function.get("arguments"))
         tool_call_lines = [f"[tool_call {index}] {name}"]
         if arguments:
@@ -152,6 +162,26 @@ def format_step_log(
         sections.append(f"[tool_result {index}]\n{content}")
 
     return "\n\n".join(section for section in sections if section).strip() + "\n"
+
+
+def compact_completed_turn(
+    messages: list[dict[str, Any]], turn_start_index: int
+) -> None:
+    if turn_start_index < 0 or turn_start_index >= len(messages):
+        return
+
+    user_message = messages[turn_start_index]
+    final_message = messages[-1]
+    if user_message.get("role") != "user" or final_message.get("role") != "assistant":
+        return
+
+    messages[turn_start_index:] = [
+        {"role": "user", "content": make_json_safe(user_message.get("content", ""))},
+        {
+            "role": "assistant",
+            "content": stringify_any(final_message.get("content", ""), strip=True),
+        },
+    ]
 
 
 def build_headers() -> dict[str, str]:
@@ -334,8 +364,10 @@ def execute_tool_calls(assistant_message: dict[str, Any]) -> list[dict[str, Any]
 
         print(f"[tool] {tool_name}", flush=True)
 
-        if tool_name == TOOL_NAME:
+        if tool_name == RUN_COMMAND_TOOL_NAME:
             tool_output = execute_run_command(arguments)
+        elif tool_name == MSFCONSOLE_TOOL_NAME:
+            tool_output = execute_msfconsole(arguments)
         else:
             tool_output = json.dumps(
                 {"ok": False, "error": f"Unknown tool: {tool_name}"},
@@ -361,6 +393,7 @@ def chat_until_complete(
     debug_think: bool,
     step_logger: StepLogger,
 ) -> list[dict[str, Any]]:
+    turn_start_index = len(messages) - 1
     tool_rounds = 0
     force_no_tools = False
 
@@ -402,6 +435,7 @@ def chat_until_complete(
         step_logger.write_model_call(assistant_message, tool_messages)
 
         if not tool_messages:
+            compact_completed_turn(messages, turn_start_index)
             return messages
 
 
