@@ -1,0 +1,4 @@
+step_logs/
+/__pycache__/
+/.venv/
+/workspace/
