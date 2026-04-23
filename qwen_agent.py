@@ -24,12 +24,7 @@ model_name = "Qwen3.5-9B-local"
 api_key = "EMPTY"
 MAX_TOOL_OUTPUT_CHARS = 6000
 
-system_prompt = (
-    "You are a helpful local Qwen agent.\n"
-    "You can use the run_command tool for shell and CLI work.\n"
-    "On Windows, commands run in PowerShell.\n"
-    "Prefer short, targeted commands and summarize results clearly."
-)
+system_prompt = Path.read_text(PROJECT_ROOT / "system_prompt.txt", encoding="utf-8")
 
 
 def clip_text(value: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
