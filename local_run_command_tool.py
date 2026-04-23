@@ -10,6 +10,8 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 MAX_TOOL_OUTPUT_CHARS = 12000
+DEFAULT_TIMEOUT_SECONDS = 900
+MAX_TIMEOUT_SECONDS = 900
 TOOL_NAME = "run_command"
 TOOL_DESCRIPTION = (
     "Run a local shell or CLI command and return the exit code, stdout, stderr, "
@@ -31,7 +33,9 @@ TOOL_PARAMETERS = {
         },
         "timeout_seconds": {
             "type": "integer",
-            "description": "Optional timeout in seconds. Defaults to 60.",
+            "description": (
+                "Optional timeout in seconds. Defaults to 900 and is capped at 900."
+            ),
         },
     },
     "required": ["command"],
@@ -95,8 +99,8 @@ def execute_run_command(params: Any) -> str:
     working_directory = str(
         Path(data.get("working_directory") or PROJECT_ROOT).expanduser()
     )
-    timeout_seconds = int(data.get("timeout_seconds", 60))
-    timeout_seconds = max(1, min(timeout_seconds, 600))
+    timeout_seconds = int(data.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+    timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT_SECONDS))
 
     shell_cmd, shell_name = build_shell_command(command)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -21,6 +22,13 @@ from local_run_command_tool import (
     TOOL_NAME as RUN_COMMAND_TOOL_NAME,
     execute_run_command,
 )
+from local_web_tools import (
+    OPENAI_TOOLS as WEB_OPENAI_TOOLS,
+    OPEN_URL_TOOL_NAME,
+    WEB_SEARCH_TOOL_NAME,
+    execute_open_url,
+    execute_web_search,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -30,8 +38,19 @@ api_key = "EMPTY"
 ENABLE_THINKING = True
 REQUEST_TIMEOUT_SECONDS = 300
 MAX_TOOL_ROUNDS_PER_TURN = 200
-system_prompt = Path.read_text(PROJECT_ROOT / "system_prompt.txt", encoding="utf-8")
-OPENAI_TOOLS = [*RUN_COMMAND_OPENAI_TOOLS, MSFCONSOLE_OPENAI_TOOL]
+WEB_TOOLS_ENABLED = os.environ.get("QWEN_ENABLE_WEB_TOOLS") == "1"
+base_system_prompt = Path.read_text(PROJECT_ROOT / "system_prompt.txt", encoding="utf-8")
+web_tools_prompt = (
+    "Web tools are enabled for this run."
+    if WEB_TOOLS_ENABLED
+    else "Web tools are disabled for this run; do not call web_search or open_url."
+)
+system_prompt = f"{base_system_prompt}\n{web_tools_prompt}"
+OPENAI_TOOLS = [
+    *RUN_COMMAND_OPENAI_TOOLS,
+    MSFCONSOLE_OPENAI_TOOL,
+    *(WEB_OPENAI_TOOLS if WEB_TOOLS_ENABLED else []),
+]
 ANSI_CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_PATTERN = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 ANSI_ESC_PATTERN = re.compile(r"\x1b[@-Z\\-_]")
@@ -482,6 +501,10 @@ def execute_tool_calls(assistant_message: dict[str, Any]) -> list[dict[str, Any]
             tool_output = execute_run_command(arguments)
         elif tool_name == MSFCONSOLE_TOOL_NAME:
             tool_output = execute_msfconsole(arguments)
+        elif tool_name == WEB_SEARCH_TOOL_NAME and WEB_TOOLS_ENABLED:
+            tool_output = execute_web_search(arguments)
+        elif tool_name == OPEN_URL_TOOL_NAME and WEB_TOOLS_ENABLED:
+            tool_output = execute_open_url(arguments)
         else:
             tool_output = json.dumps(
                 {"ok": False, "error": f"Unknown tool: {tool_name}"},
@@ -574,6 +597,7 @@ def repl(debug_raw: bool = False, debug_think: bool = False) -> None:
     print(f"Model: {model_name}")
     print(f"Server: {normalize_model_server(base_url)}")
     print("Tooling: enabled")
+    print(f"Web tools: {'enabled' if WEB_TOOLS_ENABLED else 'disabled'}")
     print(f"Step logs: {step_logger.session_dir}")
     print(f"Think debug: {'on' if debug_think else 'off'}")
     print(f"Raw debug: {'on' if debug_raw else 'off'}")

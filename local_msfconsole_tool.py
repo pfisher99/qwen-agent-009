@@ -14,8 +14,8 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 TOOL_NAME = "msfconsole"
-MAX_TOOL_OUTPUT_CHARS = 24000
-MAX_BUFFER_CHARS = 400000
+MAX_TOOL_OUTPUT_CHARS: int | None = None
+MAX_BUFFER_CHARS: int | None = None
 MSFCONSOLE_COMMAND = ["msfconsole", "-q"]
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_PATTERN = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -83,20 +83,74 @@ def output_to_text(value: Any) -> str:
     return str(value)
 
 
+def render_terminal_text(text: str) -> str:
+    text = text.replace("\r\n", "\n")
+    lines: list[str] = []
+    line: list[str] = []
+    column = 0
+
+    for char in text:
+        if char == "\r":
+            line = []
+            column = 0
+            continue
+        if char == "\n":
+            lines.append("".join(line).rstrip())
+            line = []
+            column = 0
+            continue
+        if char == "\b" or char == "\x7f":
+            column = max(0, column - 1)
+            continue
+        if char == "\t":
+            char = " "
+        elif ord(char) < 32:
+            continue
+
+        if column < len(line):
+            line[column] = char
+        else:
+            if column > len(line):
+                line.extend(" " for _ in range(column - len(line)))
+            line.append(char)
+        column += 1
+
+    if line:
+        lines.append("".join(line).rstrip())
+    return "\n".join(lines)
+
+
 def clean_output(value: Any) -> str:
     text = output_to_text(value)
     text = ANSI_OSC_PATTERN.sub("", text)
     text = ANSI_PATTERN.sub("", text)
     text = ANSI_ESC_PATTERN.sub("", text)
-    text = CONTROL_CHARS_PATTERN.sub("", text)
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    text = render_terminal_text(text)
+    return CONTROL_CHARS_PATTERN.sub("", text)
 
 
-def clip_text(value: Any, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+def clip_text(value: Any, limit: int | None = MAX_TOOL_OUTPUT_CHARS) -> str:
     text = clean_output(value)
+    if limit is None:
+        return text
     if len(text) <= limit:
         return text
     return f"{text[:limit]}\n...[truncated to {limit} characters]"
+
+
+def strip_command_echo(output: str, command: str) -> str:
+    if not output:
+        return output
+
+    lines = output.splitlines(keepends=True)
+    if not lines:
+        return output
+
+    first_line = lines[0].strip()
+    clean_command = command.strip()
+    if first_line == clean_command or first_line.endswith(clean_command):
+        return "".join(lines[1:]).lstrip("\n")
+    return output
 
 
 def bounded_wait_seconds(value: Any, default: float = 3.0) -> float:
@@ -142,12 +196,12 @@ class MsfConsoleSession:
             return len(self._output)
 
     def append_output(self, text: Any) -> None:
-        output = clean_output(text)
+        output = output_to_text(text)
         if not output:
             return
         with self._output_lock:
             self._output += output
-            if len(self._output) > MAX_BUFFER_CHARS:
+            if MAX_BUFFER_CHARS is not None and len(self._output) > MAX_BUFFER_CHARS:
                 self._output = self._output[-MAX_BUFFER_CHARS:]
                 self._output_truncated = True
 
@@ -223,6 +277,7 @@ class MsfConsoleSession:
         import pty
 
         master_fd, slave_fd = pty.openpty()
+        self._disable_pty_echo(slave_fd)
         env = {**os.environ, "TERM": "dumb", "NO_COLOR": "1"}
         try:
             self.process = subprocess.Popen(
@@ -245,6 +300,18 @@ class MsfConsoleSession:
             daemon=True,
         )
         self.reader_thread.start()
+
+    def _disable_pty_echo(self, slave_fd: int) -> None:
+        try:
+            import termios
+
+            attrs = termios.tcgetattr(slave_fd)
+            attrs[3] &= ~termios.ECHO
+            if hasattr(termios, "ECHOCTL"):
+                attrs[3] &= ~termios.ECHOCTL
+            termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+        except (ImportError, OSError):
+            pass
 
     def _start_with_pipes(self, command: list[str]) -> None:
         self.process = subprocess.Popen(
@@ -314,6 +381,7 @@ class MsfConsoleSession:
             }
 
         time.sleep(wait_seconds)
+        output = strip_command_echo(self.drain_output(), command)
         return {
             "ok": True,
             "running": self.is_running(),
@@ -321,7 +389,7 @@ class MsfConsoleSession:
             "command": command,
             "startup_output": startup_output,
             "prior_output": prior_output,
-            "output": self.drain_output(),
+            "output": output,
         }
 
     def read(self, wait_seconds: float = 3.0) -> dict[str, Any]:
