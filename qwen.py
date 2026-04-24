@@ -261,6 +261,14 @@ def format_text_block(value: Any) -> str:
     return stringify_any(value, strip=True)
 
 
+def format_tool_call_for_console(tool_name: Any, arguments: Any) -> str:
+    name = sanitize_terminal_text(tool_name).strip() or "tool"
+    call_arguments = sanitize_terminal_text(arguments).strip()
+    if not call_arguments:
+        return f"[tool] {name}"
+    return f"[tool] {name} {call_arguments}"
+
+
 def format_step_log(
     step_number: int,
     assistant_message: dict[str, Any],
@@ -495,7 +503,7 @@ def execute_tool_calls(assistant_message: dict[str, Any]) -> list[dict[str, Any]
         tool_name = function.get("name", "")
         arguments = function.get("arguments", "")
 
-        print(f"[tool] {sanitize_terminal_text(tool_name)}", flush=True)
+        print(format_tool_call_for_console(tool_name, arguments), flush=True)
 
         if tool_name == RUN_COMMAND_TOOL_NAME:
             tool_output = execute_run_command(arguments)
