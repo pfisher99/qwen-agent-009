@@ -37,7 +37,13 @@ model_name = "Qwen3.5-9B-local"
 api_key = "EMPTY"
 ENABLE_THINKING = True
 REQUEST_TIMEOUT_SECONDS = 300
+TOKENIZER_TIMEOUT_SECONDS = 60
 MAX_TOOL_ROUNDS_PER_TURN = 200
+DEFAULT_MAX_CONTEXT_TOKENS = 250000
+MAX_CONTEXT_TOKENS = min(
+    int(os.environ.get("QWEN_MAX_CONTEXT_TOKENS", str(DEFAULT_MAX_CONTEXT_TOKENS))),
+    DEFAULT_MAX_CONTEXT_TOKENS,
+)
 WEB_TOOLS_ENABLED = os.environ.get("QWEN_ENABLE_WEB_TOOLS") == "1"
 base_system_prompt = Path.read_text(PROJECT_ROOT / "system_prompt.txt", encoding="utf-8")
 web_tools_prompt = (
@@ -238,6 +244,13 @@ def normalize_model_server(url: str) -> str:
     return f"{cleaned}/v1"
 
 
+def normalize_model_root(url: str) -> str:
+    cleaned = url.rstrip("/")
+    if cleaned.endswith("/v1"):
+        return cleaned[:-3]
+    return cleaned
+
+
 def create_step_log_dir() -> Path:
     root = PROJECT_ROOT / "step_logs"
     root.mkdir(parents=True, exist_ok=True)
@@ -353,6 +366,122 @@ def sanitize_messages_for_api(messages: list[dict[str, Any]]) -> list[dict[str, 
         clean_messages.append(clean)
 
     return clean_messages
+
+
+def build_tokenizer_body(messages: list[dict[str, Any]], with_tools: bool) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": model_name,
+        "messages": messages,
+        "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
+    }
+    if with_tools:
+        body["tools"] = OPENAI_TOOLS
+        body["tool_choice"] = "auto"
+    return body
+
+
+def count_chat_tokens(messages: list[dict[str, Any]], with_tools: bool) -> int:
+    url = f"{normalize_model_root(base_url)}/tokenize"
+    request = urllib.request.Request(
+        url=url,
+        data=json.dumps(build_tokenizer_body(messages, with_tools)).encode("utf-8"),
+        headers=build_headers(),
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=TOKENIZER_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"Tokenizer failed: HTTP {exc.code}\n{error_text}") from exc
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Tokenizer failed: {exc}") from exc
+
+    count = result.get("count")
+    if isinstance(count, int):
+        return count
+
+    tokens = result.get("tokens")
+    if isinstance(tokens, list):
+        return len(tokens)
+
+    raise SystemExit(f"Tokenizer response did not include a token count: {result}")
+
+
+def default_preserve_from(messages: list[dict[str, Any]]) -> int:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            return index
+    return 1 if messages and messages[0].get("role") == "system" else 0
+
+
+def history_start_index(messages: list[dict[str, Any]]) -> int:
+    return 1 if messages and messages[0].get("role") == "system" else 0
+
+
+def trim_old_history_to_token_budget(
+    messages: list[dict[str, Any]],
+    with_tools: bool,
+    preserve_from: int,
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    history_start = history_start_index(messages)
+    preserve_from = max(history_start, min(preserve_from, len(messages)))
+    token_count = count_chat_tokens(messages, with_tools)
+    removed_messages = 0
+
+    while token_count > MAX_CONTEXT_TOKENS and history_start < preserve_from:
+        drop_until = preserve_from
+        for index in range(history_start + 1, preserve_from):
+            if messages[index].get("role") == "user":
+                drop_until = index
+                break
+
+        removed_count = drop_until - history_start
+        del messages[history_start:drop_until]
+        preserve_from -= removed_count
+        removed_messages += removed_count
+        token_count = count_chat_tokens(messages, with_tools)
+
+    return messages, preserve_from, removed_messages, token_count
+
+
+def enforce_message_token_budget(
+    messages: list[dict[str, Any]],
+    with_tools: bool,
+    preserve_from: int | None = None,
+) -> int:
+    if not messages:
+        return 0
+
+    clean_messages = sanitize_messages_for_api(messages)
+    if preserve_from is None:
+        preserve_from = default_preserve_from(clean_messages)
+    preserve_from = max(0, min(preserve_from, len(clean_messages) - 1))
+
+    original_count = count_chat_tokens(clean_messages, with_tools)
+    clean_messages, preserve_from, removed_messages, token_count = (
+        trim_old_history_to_token_budget(clean_messages, with_tools, preserve_from)
+    )
+
+    if token_count > MAX_CONTEXT_TOKENS:
+        raise SystemExit(
+            "Message history cannot fit within "
+            f"{MAX_CONTEXT_TOKENS} tokens even after dropping old history "
+            f"(current count: {token_count})."
+        )
+
+    if removed_messages:
+        print(
+            "[history] dropped old history "
+            f"{original_count} -> {token_count} tokens "
+            f"(removed {removed_messages} old message"
+            f"{'' if removed_messages == 1 else 's'}).",
+            flush=True,
+        )
+
+    messages[:] = clean_messages
+    return preserve_from
 
 
 def build_request_body(
@@ -543,9 +672,15 @@ def chat_until_complete(
     force_no_tools = False
 
     while True:
+        tools_enabled_for_request = with_tools and not force_no_tools
+        turn_start_index = enforce_message_token_budget(
+            messages,
+            with_tools=tools_enabled_for_request,
+            preserve_from=turn_start_index,
+        )
         assistant_message, finish_reason = stream_chat_completion(
             messages,
-            with_tools=with_tools and not force_no_tools,
+            with_tools=tools_enabled_for_request,
             debug_raw=debug_raw,
             debug_think=debug_think,
         )
@@ -580,7 +715,8 @@ def chat_until_complete(
         step_logger.write_model_call(assistant_message, tool_messages)
 
         if not tool_messages:
-            compact_completed_turn(messages, turn_start_index)
+            # Keep completed tool transcripts in history so later turns can
+            # reason from exact commands, outputs, and tool state transitions.
             return messages
 
 

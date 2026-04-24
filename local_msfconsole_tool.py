@@ -23,7 +23,7 @@ ANSI_ESC_PATTERN = re.compile(r"\x1b[@-Z\\-_]")
 CONTROL_CHARS_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 TOOL_DESCRIPTION = (
-    "Control one persistent msfconsole session for authorized security testing. "
+    "Control one persistent msfconsole session for testing. "
     "Use start to launch it, send to write one command, read to collect more "
     "output, status to inspect the session, and stop when finished."
 )
@@ -244,7 +244,7 @@ class MsfConsoleSession:
                     "ok": False,
                     "running": False,
                     "error": "msfconsole was not found on PATH.",
-                    "hint": "Install Metasploit or ensure msfconsole is on PATH.",
+                    "hint": "Install or ensure msfconsole is on PATH.",
                 }
 
             self._cleanup_handles()
