@@ -14,8 +14,8 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 TOOL_NAME = "msfconsole"
-MAX_TOOL_OUTPUT_CHARS: int | None = None
-MAX_BUFFER_CHARS: int | None = None
+DEFAULT_MAX_TOOL_OUTPUT_CHARS = 30000
+DEFAULT_MAX_BUFFER_CHARS = 200000
 MSFCONSOLE_COMMAND = ["msfconsole", "-q"]
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_PATTERN = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -59,6 +59,24 @@ OPENAI_TOOL = {
         "parameters": TOOL_PARAMETERS,
     },
 }
+
+
+def positive_int_from_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+MAX_TOOL_OUTPUT_CHARS = positive_int_from_env(
+    "MSFCONSOLE_MAX_TOOL_OUTPUT_CHARS",
+    DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+)
+MAX_BUFFER_CHARS = positive_int_from_env(
+    "MSFCONSOLE_MAX_BUFFER_CHARS",
+    DEFAULT_MAX_BUFFER_CHARS,
+)
 
 
 def load_tool_params(params: Any) -> dict[str, Any]:
@@ -135,7 +153,13 @@ def clip_text(value: Any, limit: int | None = MAX_TOOL_OUTPUT_CHARS) -> str:
         return text
     if len(text) <= limit:
         return text
-    return f"{text[:limit]}\n...[truncated to {limit} characters]"
+    marker = "\n...[truncated middle output]...\n"
+    content_budget = max(0, limit - len(marker))
+    head_chars = content_budget // 3
+    tail_chars = content_budget - head_chars
+    if tail_chars <= 0:
+        return text[:content_budget]
+    return f"{text[:head_chars]}{marker}{text[-tail_chars:]}"
 
 
 def strip_command_echo(output: str, command: str) -> str:

@@ -39,7 +39,12 @@ ENABLE_THINKING = True
 REQUEST_TIMEOUT_SECONDS = 300
 TOKENIZER_TIMEOUT_SECONDS = 60
 MAX_TOOL_ROUNDS_PER_TURN = 200
-DEFAULT_MAX_CONTEXT_TOKENS = 250000
+DEFAULT_MAX_OUTPUT_TOKENS = 80000
+MAX_OUTPUT_TOKENS = min(
+    int(os.environ.get("QWEN_MAX_OUTPUT_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS))),
+    DEFAULT_MAX_OUTPUT_TOKENS,
+)
+DEFAULT_MAX_CONTEXT_TOKENS = 160000
 MAX_CONTEXT_TOKENS = min(
     int(os.environ.get("QWEN_MAX_CONTEXT_TOKENS", str(DEFAULT_MAX_CONTEXT_TOKENS))),
     DEFAULT_MAX_CONTEXT_TOKENS,
@@ -64,10 +69,11 @@ CONTROL_CHARS_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 TERMINAL_RESET_SEQUENCE = "\x1b[0m\x1b[?25h\x1b[?2004l"
 
 generate_cfg = {
-    "temperature": 0.6,
+    "temperature": 1.0,
     "top_p": 0.95,
     "top_k": 20,
-    "presence_penalty": 0.0,
+    "max_tokens": MAX_OUTPUT_TOKENS,
+    "presence_penalty": 1.5,
     "repetition_penalty": 1.0,
 }
 
