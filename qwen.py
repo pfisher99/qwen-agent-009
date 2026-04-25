@@ -6,6 +6,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -37,7 +39,10 @@ model_name = "Qwen3.5-9B-local"
 api_key = "EMPTY"
 ENABLE_THINKING = True
 REQUEST_TIMEOUT_SECONDS = 300
-TOKENIZER_TIMEOUT_SECONDS = 60
+REQUEST_RETRY_ATTEMPTS = 3
+REQUEST_RETRY_BACKOFF_SECONDS = 2.0
+TIKTOKEN_ENCODING_NAME = os.environ.get("QWEN_TIKTOKEN_ENCODING", "cl100k_base")
+FALLBACK_BYTES_PER_TOKEN = 3
 MAX_TOOL_ROUNDS_PER_TURN = 200
 DEFAULT_MAX_OUTPUT_TOKENS = 80000
 MAX_OUTPUT_TOKENS = min(
@@ -56,10 +61,63 @@ web_tools_prompt = (
     if WEB_TOOLS_ENABLED
     else "Web tools are disabled for this run; do not call web_search or open_url."
 )
-system_prompt = f"{base_system_prompt}\n{web_tools_prompt}"
+assistant_tools_prompt = (
+    "You can use assistant_agent to start, list, check, and read helper agents. "
+    "Each helper calls this same local model with no tools and keeps its own chat memory."
+)
+system_prompt = f"{base_system_prompt}\n{assistant_tools_prompt}\n{web_tools_prompt}"
+ASSISTANT_AGENT_TOOL_NAME = "assistant_agent"
+ASSISTANT_AGENT_OPENAI_TOOL = {
+    "type": "function",
+    "function": {
+        "name": ASSISTANT_AGENT_TOOL_NAME,
+        "description": (
+            "Manage simple helper agents that have the same access you do. "
+            "Use start to assign a new task, send to continue an idle agent, list/status "
+            "to see what each agent was tasked with and whether it is busy, and read to "
+            "retrieve the latest result."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "send", "list", "status", "read"],
+                    "description": (
+                        "Agent action. Defaults to start when task is present, otherwise list."
+                    ),
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Task for a new helper agent when action is start.",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Agent identifier for send, status, or read.",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Follow-up message for an idle helper agent when action is send.",
+                },
+                "wait_seconds": {
+                    "type": "number",
+                    "description": (
+                        "Optional seconds to wait for the helper to finish before returning. "
+                        "Defaults to 0 and is capped at 300."
+                    ),
+                },
+                "include_messages": {
+                    "type": "boolean",
+                    "description": "Include the helper agent's chat memory in status/read output.",
+                },
+            },
+        },
+    },
+}
 OPENAI_TOOLS = [
     *RUN_COMMAND_OPENAI_TOOLS,
     MSFCONSOLE_OPENAI_TOOL,
+    ASSISTANT_AGENT_OPENAI_TOOL,
     *(WEB_OPENAI_TOOLS if WEB_TOOLS_ENABLED else []),
 ]
 ANSI_CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -78,25 +136,28 @@ generate_cfg = {
     "presence_penalty": 1.5,
     "repetition_penalty": 1.0,
 }
+_TIKTOKEN_ENCODER: Any | None = None
+_TIKTOKEN_IMPORT_ATTEMPTED = False
 
 
 class StepLogger:
-    def __init__(self) -> None:
-        self.session_dir = create_step_log_dir()
+    def __init__(self, session_dir: Path | None = None) -> None:
+        self.session_dir = session_dir or create_step_log_dir()
+        self.session_dir.mkdir(parents=True, exist_ok=True)
         self.step_number = 0
+        self._lock = threading.Lock()
 
     def write_model_call(
         self,
         assistant_message: dict[str, Any],
         tool_messages: list[dict[str, Any]] | None = None,
     ) -> Path:
-        self.step_number += 1
-        path = self.session_dir / f"step{self.step_number}.txt"
-        text = format_step_log(
-            self.step_number,
-            assistant_message,
-            tool_messages or [],
-        )
+        with self._lock:
+            self.step_number += 1
+            step_number = self.step_number
+
+        path = self.session_dir / f"step{step_number}.txt"
+        text = format_step_log(step_number, assistant_message, tool_messages or [])
         path.write_text(text, encoding="utf-8")
         return path
 
@@ -245,6 +306,32 @@ def stringify_any(value: Any, strip: bool = False) -> str:
     return text
 
 
+def load_tool_params(params: Any) -> dict[str, Any]:
+    if isinstance(params, dict):
+        return params
+    if isinstance(params, (bytes, bytearray)):
+        params = bytes(params).decode("utf-8", errors="replace")
+    if not isinstance(params, str):
+        raise TypeError(f"Unsupported params type: {type(params).__name__}")
+
+    text = params.strip()
+    if not text:
+        return {}
+    return json.loads(text)
+
+
+def iso_timestamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def bounded_wait_seconds(value: Any, default: float = 0.0) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = default
+    return max(0.0, min(seconds, REQUEST_TIMEOUT_SECONDS))
+
+
 def normalize_model_server(url: str) -> str:
     cleaned = url.rstrip("/")
     if cleaned.endswith("/v1"):
@@ -376,7 +463,7 @@ def sanitize_messages_for_api(messages: list[dict[str, Any]]) -> list[dict[str, 
     return clean_messages
 
 
-def build_tokenizer_body(messages: list[dict[str, Any]], with_tools: bool) -> dict[str, Any]:
+def build_token_count_body(messages: list[dict[str, Any]], with_tools: bool) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": model_name,
         "messages": messages,
@@ -388,33 +475,38 @@ def build_tokenizer_body(messages: list[dict[str, Any]], with_tools: bool) -> di
     return body
 
 
-def count_chat_tokens(messages: list[dict[str, Any]], with_tools: bool) -> int:
-    url = f"{normalize_model_root(base_url)}/tokenize"
-    request = urllib.request.Request(
-        url=url,
-        data=json.dumps(build_tokenizer_body(messages, with_tools)).encode("utf-8"),
-        headers=build_headers(),
-        method="POST",
-    )
+def get_tiktoken_encoder() -> Any | None:
+    global _TIKTOKEN_ENCODER, _TIKTOKEN_IMPORT_ATTEMPTED
 
+    if _TIKTOKEN_IMPORT_ATTEMPTED:
+        return _TIKTOKEN_ENCODER
+
+    _TIKTOKEN_IMPORT_ATTEMPTED = True
     try:
-        with urllib.request.urlopen(request, timeout=TOKENIZER_TIMEOUT_SECONDS) as response:
-            result = json.loads(response.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace")
-        raise SystemExit(f"Tokenizer failed: HTTP {exc.code}\n{error_text}") from exc
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"Tokenizer failed: {exc}") from exc
+        import tiktoken
 
-    count = result.get("count")
-    if isinstance(count, int):
-        return count
+        _TIKTOKEN_ENCODER = tiktoken.get_encoding(TIKTOKEN_ENCODING_NAME)
+    except Exception:
+        _TIKTOKEN_ENCODER = None
+    return _TIKTOKEN_ENCODER
 
-    tokens = result.get("tokens")
-    if isinstance(tokens, list):
-        return len(tokens)
 
-    raise SystemExit(f"Tokenizer response did not include a token count: {result}")
+def count_text_tokens_offline(text: str) -> int:
+    encoder = get_tiktoken_encoder()
+    if encoder is not None:
+        return len(encoder.encode(text))
+
+    byte_count = len(text.encode("utf-8", errors="replace"))
+    return max(1, (byte_count + FALLBACK_BYTES_PER_TOKEN - 1) // FALLBACK_BYTES_PER_TOKEN)
+
+
+def count_chat_tokens(messages: list[dict[str, Any]], with_tools: bool) -> int:
+    body = build_token_count_body(messages, with_tools)
+    text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    template_overhead = 8 * len(messages)
+    if with_tools:
+        template_overhead += 64
+    return count_text_tokens_offline(text) + template_overhead
 
 
 def default_preserve_from(messages: list[dict[str, Any]]) -> int:
@@ -458,6 +550,7 @@ def enforce_message_token_budget(
     messages: list[dict[str, Any]],
     with_tools: bool,
     preserve_from: int | None = None,
+    quiet: bool = False,
 ) -> int:
     if not messages:
         return 0
@@ -479,7 +572,7 @@ def enforce_message_token_budget(
             f"(current count: {token_count})."
         )
 
-    if removed_messages:
+    if removed_messages and not quiet:
         print(
             "[history] dropped old history "
             f"{original_count} -> {token_count} tokens "
@@ -549,15 +642,13 @@ def stream_chat_completion(
     with_tools: bool,
     debug_raw: bool,
     debug_think: bool,
+    echo: bool = True,
+    output_label: str | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     url = f"{normalize_model_server(base_url)}/chat/completions"
-    body = build_request_body(messages, with_tools=with_tools, stream=True)
-    request = urllib.request.Request(
-        url=url,
-        data=json.dumps(body).encode("utf-8"),
-        headers=build_headers(),
-        method="POST",
-    )
+    request_data = json.dumps(
+        build_request_body(messages, with_tools=with_tools, stream=True)
+    ).encode("utf-8")
 
     assistant_message: dict[str, Any] = {
         "role": "assistant",
@@ -569,13 +660,37 @@ def stream_chat_completion(
     think_started = False
     printed_output = False
 
-    try:
-        response = urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS)
-    except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace")
-        raise SystemExit(f"Request failed: HTTP {exc.code}\n{error_text}") from exc
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"Request failed: {exc}") from exc
+    for attempt in range(1, REQUEST_RETRY_ATTEMPTS + 1):
+        request = urllib.request.Request(
+            url=url,
+            data=request_data,
+            headers=build_headers(),
+            method="POST",
+        )
+
+        try:
+            response = urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS)
+            break
+        except urllib.error.HTTPError as exc:
+            error_text = exc.read().decode("utf-8", errors="replace")
+            raise SystemExit(f"Request failed: HTTP {exc.code}\n{error_text}") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            if attempt >= REQUEST_RETRY_ATTEMPTS:
+                raise SystemExit(
+                    f"Request failed after {REQUEST_RETRY_ATTEMPTS} attempts: {exc}"
+                ) from exc
+
+            delay = REQUEST_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            retry_prefix = f"[{output_label}] " if output_label else ""
+            print(
+                f"{retry_prefix}[request] chat completion failed "
+                f"(attempt {attempt}/{REQUEST_RETRY_ATTEMPTS}): {exc}; "
+                f"retrying in {delay:.1f}s.",
+                flush=True,
+            )
+            time.sleep(delay)
+    else:
+        raise SystemExit("Request failed before receiving a response.")
 
     with response:
         for raw_line in response:
@@ -607,8 +722,15 @@ def stream_chat_completion(
             content_delta = delta.get("content") or ""
             if content_delta:
                 assistant_message["content"] += content_delta
-                print_stream_text(content_delta)
-                printed_output = True
+                if echo:
+                    output_delta = content_delta
+                    if not printed_output:
+                        output_delta = output_delta.lstrip("\n")
+                        if output_label and output_delta:
+                            print_stream_text(f"[{output_label}] ")
+                    if output_delta:
+                        print_stream_text(output_delta)
+                        printed_output = True
 
             delta_tool_calls = delta.get("tool_calls") or []
             if delta_tool_calls:
@@ -621,8 +743,9 @@ def stream_chat_completion(
         print("\n</think>", file=sys.stderr)
     if printed_output:
         print()
-    clear_terminal_output_sanitizers()
-    TERMINAL_GUARD.restore()
+    if echo or debug_think:
+        clear_terminal_output_sanitizers()
+        TERMINAL_GUARD.restore()
 
     if not assistant_message["tool_calls"]:
         assistant_message.pop("tool_calls")
@@ -632,7 +755,286 @@ def stream_chat_completion(
     return assistant_message, finish_reason
 
 
-def execute_tool_calls(assistant_message: dict[str, Any]) -> list[dict[str, Any]]:
+ASSISTANT_AGENT_SYSTEM_PROMPT = Path.read_text(PROJECT_ROOT / "system_prompt_agent.txt", encoding="utf-8").strip()
+
+
+class AssistantAgentRecord:
+    def __init__(self, agent_id: str, task: str, log_dir: Path) -> None:
+        self.agent_id = agent_id
+        self.task = task
+        self.created_at = iso_timestamp()
+        self.updated_at = self.created_at
+        self.status = "queued"
+        self.busy = False
+        self.turn_count = 0
+        self.last_result = ""
+        self.last_error = ""
+        self.thread: threading.Thread | None = None
+        self.lock = threading.RLock()
+        self.step_logger = StepLogger(log_dir)
+        self.messages: list[dict[str, Any]] = [
+            {"role": "system", "content": ASSISTANT_AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": task},
+        ]
+
+    def refresh_status_locked(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            self.busy = True
+            self.status = "running"
+        elif self.busy:
+            self.busy = False
+            if self.status == "running":
+                self.status = "completed" if not self.last_error else "error"
+
+    def snapshot(
+        self,
+        include_result: bool = False,
+        include_messages: bool = False,
+    ) -> dict[str, Any]:
+        with self.lock:
+            self.refresh_status_locked()
+            result: dict[str, Any] = {
+                "agent_id": self.agent_id,
+                "task": self.task,
+                "status": self.status,
+                "busy": self.busy,
+                "turn_count": self.turn_count,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+                "step_log_dir": str(self.step_logger.session_dir),
+            }
+            if self.last_error:
+                result["last_error"] = self.last_error
+            if include_result:
+                result["last_result"] = self.last_result
+            if include_messages:
+                result["messages"] = make_json_safe(self.messages)
+            return result
+
+
+class AssistantAgentManager:
+    def __init__(self, parent_step_log_dir: Path) -> None:
+        self.log_root = parent_step_log_dir / "assistant_agents"
+        self.log_root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._counter = 0
+        self._agents: dict[str, AssistantAgentRecord] = {}
+
+    def execute(self, params: Any) -> str:
+        try:
+            data = load_tool_params(params)
+            action = str(data.get("action") or ("start" if data.get("task") else "list"))
+            action = action.strip().lower()
+            wait_seconds = bounded_wait_seconds(data.get("wait_seconds"), default=0.0)
+            include_messages = bool(data.get("include_messages"))
+
+            if action == "start":
+                result = self.start_agent(str(data.get("task") or ""), wait_seconds)
+            elif action == "send":
+                result = self.send_agent(
+                    str(data.get("agent_id") or ""),
+                    str(data.get("message") or ""),
+                    wait_seconds,
+                )
+            elif action == "list":
+                result = self.list_agents()
+            elif action == "status":
+                agent_id = str(data.get("agent_id") or "").strip()
+                result = (
+                    self.agent_status(agent_id, include_messages=include_messages)
+                    if agent_id
+                    else self.list_agents()
+                )
+            elif action == "read":
+                result = self.read_agent(
+                    str(data.get("agent_id") or ""),
+                    wait_seconds,
+                    include_messages=include_messages,
+                )
+            else:
+                result = {"ok": False, "error": f"Unknown assistant_agent action: {action}"}
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+
+        return json.dumps(make_json_safe(result), ensure_ascii=False, indent=2)
+
+    def start_agent(self, task: str, wait_seconds: float) -> dict[str, Any]:
+        task = task.strip()
+        if not task:
+            return {"ok": False, "error": "task must not be empty"}
+
+        with self._lock:
+            self._counter += 1
+            agent_id = f"agent_{self._counter}"
+            agent = AssistantAgentRecord(agent_id, task, self.log_root / agent_id)
+            self._agents[agent_id] = agent
+
+        self._launch_turn(agent)
+        self._wait_for_agent(agent, wait_seconds)
+        return {
+            "ok": True,
+            "agent": agent.snapshot(include_result=not agent.busy),
+        }
+
+    def send_agent(
+        self,
+        agent_id: str,
+        message: str,
+        wait_seconds: float,
+    ) -> dict[str, Any]:
+        agent = self._get_agent(agent_id)
+        if agent is None:
+            return {"ok": False, "error": f"Unknown agent_id: {agent_id}"}
+
+        message = message.strip()
+        if not message:
+            return {"ok": False, "error": "message must not be empty"}
+
+        with agent.lock:
+            agent.refresh_status_locked()
+            if agent.busy:
+                return {
+                    "ok": False,
+                    "error": f"{agent.agent_id} is busy",
+                    "agent": agent.snapshot(),
+                }
+            agent.messages.append({"role": "user", "content": message})
+            agent.status = "queued"
+            agent.updated_at = iso_timestamp()
+            self._write_memory(agent)
+
+        self._launch_turn(agent)
+        self._wait_for_agent(agent, wait_seconds)
+        return {
+            "ok": True,
+            "agent": agent.snapshot(include_result=not agent.busy),
+        }
+
+    def list_agents(self) -> dict[str, Any]:
+        with self._lock:
+            agents = list(self._agents.values())
+        return {
+            "ok": True,
+            "agents": [agent.snapshot(include_result=False) for agent in agents],
+        }
+
+    def agent_status(
+        self,
+        agent_id: str,
+        include_messages: bool = False,
+    ) -> dict[str, Any]:
+        agent = self._get_agent(agent_id)
+        if agent is None:
+            return {"ok": False, "error": f"Unknown agent_id: {agent_id}"}
+        return {
+            "ok": True,
+            "agent": agent.snapshot(
+                include_result=True,
+                include_messages=include_messages,
+            ),
+        }
+
+    def read_agent(
+        self,
+        agent_id: str,
+        wait_seconds: float,
+        include_messages: bool = False,
+    ) -> dict[str, Any]:
+        agent = self._get_agent(agent_id)
+        if agent is None:
+            return {"ok": False, "error": f"Unknown agent_id: {agent_id}"}
+        self._wait_for_agent(agent, wait_seconds)
+        return {
+            "ok": True,
+            "agent": agent.snapshot(
+                include_result=True,
+                include_messages=include_messages,
+            ),
+        }
+
+    def _get_agent(self, agent_id: str) -> AssistantAgentRecord | None:
+        with self._lock:
+            return self._agents.get(agent_id.strip())
+
+    def _launch_turn(self, agent: AssistantAgentRecord) -> None:
+        with agent.lock:
+            agent.busy = True
+            agent.status = "running"
+            agent.last_error = ""
+            agent.updated_at = iso_timestamp()
+            self._write_memory(agent)
+            thread = threading.Thread(
+                target=self._run_agent_turn,
+                args=(agent,),
+                name=f"assistant-agent-{agent.agent_id}",
+                daemon=True,
+            )
+            agent.thread = thread
+            thread.start()
+
+    def _run_agent_turn(self, agent: AssistantAgentRecord) -> None:
+        try:
+            chat_until_complete(
+                agent.messages,
+                with_tools=True,
+                debug_raw=False,
+                debug_think=False,
+                step_logger=agent.step_logger,
+                assistant_agent_manager=self,
+                echo=True,
+                output_label=agent.agent_id,
+            )
+            final_message = agent.messages[-1] if agent.messages else {}
+            last_result = stringify_any(final_message.get("content", ""), strip=True)
+            with agent.lock:
+                agent.last_result = last_result
+                agent.turn_count += 1
+                agent.status = "completed"
+                agent.busy = False
+                agent.updated_at = iso_timestamp()
+                self._write_memory(agent)
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            with agent.lock:
+                agent.last_error = str(exc)
+                agent.status = "error"
+                agent.busy = False
+                agent.updated_at = iso_timestamp()
+                self._write_memory(agent)
+
+    def _wait_for_agent(self, agent: AssistantAgentRecord, wait_seconds: float) -> None:
+        if wait_seconds <= 0:
+            return
+        thread = agent.thread
+        if thread is not None:
+            thread.join(timeout=wait_seconds)
+
+    def _write_memory(self, agent: AssistantAgentRecord) -> None:
+        memory = {
+            "agent_id": agent.agent_id,
+            "task": agent.task,
+            "status": agent.status,
+            "busy": agent.busy,
+            "turn_count": agent.turn_count,
+            "created_at": agent.created_at,
+            "updated_at": agent.updated_at,
+            "last_error": agent.last_error,
+            "messages": agent.messages,
+        }
+        path = agent.step_logger.session_dir / "memory.json"
+        path.write_text(
+            json.dumps(make_json_safe(memory), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def execute_tool_calls(
+    assistant_message: dict[str, Any],
+    assistant_agent_manager: AssistantAgentManager,
+    echo: bool = True,
+    output_label: str | None = None,
+) -> list[dict[str, Any]]:
     tool_messages: list[dict[str, Any]] = []
 
     for tool_call in assistant_message.get("tool_calls", []):
@@ -640,12 +1042,18 @@ def execute_tool_calls(assistant_message: dict[str, Any]) -> list[dict[str, Any]
         tool_name = function.get("name", "")
         arguments = function.get("arguments", "")
 
-        print(format_tool_call_for_console(tool_name, arguments), flush=True)
+        if echo:
+            tool_line = format_tool_call_for_console(tool_name, arguments)
+            if output_label:
+                tool_line = f"[{output_label}] {tool_line}"
+            print(tool_line, flush=True)
 
         if tool_name == RUN_COMMAND_TOOL_NAME:
             tool_output = execute_run_command(arguments)
         elif tool_name == MSFCONSOLE_TOOL_NAME:
             tool_output = execute_msfconsole(arguments)
+        elif tool_name == ASSISTANT_AGENT_TOOL_NAME:
+            tool_output = assistant_agent_manager.execute(arguments)
         elif tool_name == WEB_SEARCH_TOOL_NAME and WEB_TOOLS_ENABLED:
             tool_output = execute_web_search(arguments)
         elif tool_name == OPEN_URL_TOOL_NAME and WEB_TOOLS_ENABLED:
@@ -674,6 +1082,9 @@ def chat_until_complete(
     debug_raw: bool,
     debug_think: bool,
     step_logger: StepLogger,
+    assistant_agent_manager: AssistantAgentManager,
+    echo: bool = True,
+    output_label: str | None = None,
 ) -> list[dict[str, Any]]:
     turn_start_index = len(messages) - 1
     tool_rounds = 0
@@ -685,12 +1096,15 @@ def chat_until_complete(
             messages,
             with_tools=tools_enabled_for_request,
             preserve_from=turn_start_index,
+            quiet=not echo,
         )
         assistant_message, finish_reason = stream_chat_completion(
             messages,
             with_tools=tools_enabled_for_request,
             debug_raw=debug_raw,
             debug_think=debug_think,
+            echo=echo,
+            output_label=output_label,
         )
         messages.append(assistant_message)
 
@@ -702,7 +1116,12 @@ def chat_until_complete(
             and assistant_message.get("tool_calls")
         ):
             tool_rounds += 1
-            tool_messages = execute_tool_calls(assistant_message)
+            tool_messages = execute_tool_calls(
+                assistant_message,
+                assistant_agent_manager,
+                echo=echo,
+                output_label=output_label,
+            )
             messages.extend(tool_messages)
             if tool_rounds >= MAX_TOOL_ROUNDS_PER_TURN:
                 print(
@@ -731,6 +1150,7 @@ def chat_until_complete(
 def run_once(query: str, debug_raw: bool = False, debug_think: bool = False) -> None:
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     step_logger = StepLogger()
+    assistant_agent_manager = AssistantAgentManager(step_logger.session_dir)
     messages.append({"role": "user", "content": query})
     print(f"Step logs: {step_logger.session_dir}")
     chat_until_complete(
@@ -739,16 +1159,19 @@ def run_once(query: str, debug_raw: bool = False, debug_think: bool = False) -> 
         debug_raw=debug_raw,
         debug_think=debug_think,
         step_logger=step_logger,
+        assistant_agent_manager=assistant_agent_manager,
     )
 
 
 def repl(debug_raw: bool = False, debug_think: bool = False) -> None:
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     step_logger = StepLogger()
+    assistant_agent_manager = AssistantAgentManager(step_logger.session_dir)
 
     print(f"Model: {model_name}")
     print(f"Server: {normalize_model_server(base_url)}")
     print("Tooling: enabled")
+    print("Assistant agents: enabled")
     print(f"Web tools: {'enabled' if WEB_TOOLS_ENABLED else 'disabled'}")
     print(f"Step logs: {step_logger.session_dir}")
     print(f"Think debug: {'on' if debug_think else 'off'}")
@@ -770,6 +1193,7 @@ def repl(debug_raw: bool = False, debug_think: bool = False) -> None:
             debug_raw=debug_raw,
             debug_think=debug_think,
             step_logger=step_logger,
+            assistant_agent_manager=assistant_agent_manager,
         )
 
 
