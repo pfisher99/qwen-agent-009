@@ -49,7 +49,7 @@ MAX_CONTEXT_TOKENS = min(
     int(os.environ.get("QWEN_MAX_CONTEXT_TOKENS", str(DEFAULT_MAX_CONTEXT_TOKENS))),
     DEFAULT_MAX_CONTEXT_TOKENS,
 )
-WEB_TOOLS_ENABLED = os.environ.get("QWEN_ENABLE_WEB_TOOLS") == "1"
+WEB_TOOLS_ENABLED =  os.environ.get("QWEN_ENABLE_WEB_TOOLS") == "1"
 base_system_prompt = Path.read_text(PROJECT_ROOT / "system_prompt.txt", encoding="utf-8")
 web_tools_prompt = (
     "Web tools are enabled for this run."
@@ -72,7 +72,9 @@ generate_cfg = {
     "temperature": 1.0,
     "top_p": 0.95,
     "top_k": 20,
+    "min_p": 0.0,
     "max_tokens": MAX_OUTPUT_TOKENS,
+    "max_thinking_tokens": 50000,
     "presence_penalty": 1.5,
     "repetition_penalty": 1.0,
 }
